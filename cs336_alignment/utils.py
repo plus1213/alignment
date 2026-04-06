@@ -1,5 +1,6 @@
 import gc
 import json
+import math
 from contextlib import nullcontext
 
 import rich
@@ -70,6 +71,25 @@ def get_device(verbose: bool = True, rank: int = 0, use_mps: bool = True) -> tor
         if verbose:
             print_color("Using CPU device", "blue")
         return torch.device("cpu")
+
+
+def get_model_loading_kwargs(device: torch.device) -> dict:
+    kwargs = {"device_map": "cpu"}
+    if device.type == "cuda":
+        kwargs["torch_dtype"] = torch.bfloat16
+        kwargs["attn_implementation"] = "flash_attention_2"
+    elif device.type == "mps":
+        kwargs["torch_dtype"] = torch.float16
+    else:
+        kwargs["torch_dtype"] = torch.float32
+    return kwargs
+
+
+def compute_response_masked_mean(tensor: torch.Tensor, response_mask: torch.Tensor) -> torch.Tensor:
+    masked = tensor * response_mask.type_as(tensor)
+    counts = response_mask.sum(dim=-1).clamp(min=1).type_as(tensor)
+    per_example = masked.sum(dim=-1) / counts
+    return per_example.mean()
 
 
 def save_model_checkpoint(

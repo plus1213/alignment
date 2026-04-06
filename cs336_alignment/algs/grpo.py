@@ -28,6 +28,7 @@ from cs336_alignment.drgrpo_grader import question_only_reward_fn, r1_zero_rewar
 from cs336_alignment.eval import evaluate_responses
 from cs336_alignment.utils import (
     clear_memory,
+    compute_response_masked_mean,
     get_ctx,
     load_dataset,
     print_color,
@@ -40,6 +41,19 @@ from cs336_alignment.vllm_utils import (
 )
 
 REWARD_FN_MAP = {"r1_zero_reward_fn": r1_zero_reward_fn, "question_only_reward_fn": question_only_reward_fn}
+
+
+def iter_grpo_batch_indices(
+    num_samples: int,
+    train_batch_size: int,
+    epochs_per_rollout_batch: int,
+) -> list[torch.Tensor]:
+    all_batches = []
+    for _ in range(epochs_per_rollout_batch):
+        epoch_indices = torch.randperm(num_samples)
+        for start in range(0, num_samples, train_batch_size):
+            all_batches.append(epoch_indices[start : start + train_batch_size])
+    return all_batches
 
 
 @dataclass
@@ -84,6 +98,9 @@ class GRPOTrainConfig(BaseConfig):
         assert self.rollout_batch_size % self.group_size == 0, (
             "rollout_batch_size must be divisible by group_size"
         )
+        assert self.train_batch_size % self.gradient_accumulation_steps == 0, (
+            "train_batch_size must be divisible by gradient_accumulation_steps"
+        )
         self.micro_batch_size = self.train_batch_size // self.gradient_accumulation_steps
         self.n_prompts_per_rollout_batch = self.rollout_batch_size // self.group_size
 
@@ -109,7 +126,7 @@ def compute_group_normalized_rewards(
     advs = []
     for i in range(0, len(rewards), group_size):
         group_rewards = rewards[i : i + group_size]
-        group_rewards_tensor = torch.tensor(group_rewards)
+        group_rewards_tensor = torch.tensor(group_rewards, dtype=torch.float32)
         group_mean = torch.mean(group_rewards_tensor)
         if normalized_by_std:
             group_std = torch.std(group_rewards_tensor) + advantage_eps
@@ -118,9 +135,21 @@ def compute_group_normalized_rewards(
             normalized_rewards = group_rewards_tensor - group_mean
         advs.extend(normalized_rewards.tolist())
 
-    meta_info = {}
+    rewards_tensor = torch.tensor(rewards, dtype=torch.float32)
+    normalized_rewards_tensor = torch.tensor(advs, dtype=torch.float32)
+    formatted_rewards_tensor = torch.tensor(formatted_rewards, dtype=torch.float32)
+    answer_correct_rewards_tensor = torch.tensor(answer_correct_rewards, dtype=torch.float32)
 
-    return advs, rewards, meta_info
+    meta_info = {
+        "reward_mean": float(rewards_tensor.mean().item()),
+        "reward_std": float(rewards_tensor.std().item()),
+        "format_reward_mean": float(formatted_rewards_tensor.mean().item()),
+        "answer_reward_mean": float(answer_correct_rewards_tensor.mean().item()),
+        "advantage_mean": float(normalized_rewards_tensor.mean().item()),
+        "advantage_std": float(normalized_rewards_tensor.std().item()),
+    }
+
+    return normalized_rewards_tensor, rewards_tensor, meta_info
 
 
 ## ------ Loss Computation ------ ##
@@ -424,30 +453,37 @@ class GRPOTrainer:
         old_log_probs = torch.cat(old_log_probs, dim=0)
         self.model.train()
 
-        n_train_steps = self.train_config.epochs_per_rollout_batch * (
-            self.train_config.rollout_batch_size // self.train_config.train_batch_size
+        advantages = advantages.to(self.device)
+        raw_rewards = raw_rewards.to(self.device)
+        old_log_probs = old_log_probs.to(self.device)
+
+        train_batches = iter_grpo_batch_indices(
+            num_samples=input_ids.size(0),
+            train_batch_size=self.train_config.train_batch_size,
+            epochs_per_rollout_batch=self.train_config.epochs_per_rollout_batch,
         )
 
-        print_color(f"Performing {n_train_steps} training steps...", color="green")
+        print_color(f"Performing {len(train_batches)} training steps...", color="green")
         batch_loss = 0.0
         token_entropy_avg = 0.0
-        for train_step in range(n_train_steps):
-            for micro_step in trange(
-                self.train_config.gradient_accumulation_steps,
+        for train_step, batch_indices in enumerate(train_batches, start=1):
+            micro_batches = [
+                batch_indices[start : start + self.train_config.micro_batch_size]
+                for start in range(0, len(batch_indices), self.train_config.micro_batch_size)
+            ]
+            micro_batches = [micro for micro in micro_batches if len(micro) > 0]
+
+            for micro_indices in trange(
+                len(micro_batches),
                 desc="Microbatches",
             ):
-                start_index = micro_step * (
-                    self.train_config.train_batch_size // self.train_config.gradient_accumulation_steps
-                )
-                end_index = start_index + (
-                    self.train_config.train_batch_size // self.train_config.gradient_accumulation_steps
-                )
-                micro_input_ids = input_ids[start_index:end_index]
-                micro_labels = labels[start_index:end_index]
-                micro_response_mask = response_mask[start_index:end_index]
-                micro_advantages = torch.tensor(advantages[start_index:end_index]).to(self.device)
-                micro_raw_rewards = torch.tensor(raw_rewards[start_index:end_index]).to(self.device)
-                micro_old_log_probs = old_log_probs[start_index:end_index].to(self.device)
+                current_indices = micro_batches[micro_indices]
+                micro_input_ids = input_ids[current_indices]
+                micro_labels = labels[current_indices]
+                micro_response_mask = response_mask[current_indices]
+                micro_advantages = advantages[current_indices]
+                micro_raw_rewards = raw_rewards[current_indices]
+                micro_old_log_probs = old_log_probs[current_indices]
 
                 with self.ctx:
                     policy_outputs = get_response_log_probs(
@@ -458,11 +494,12 @@ class GRPOTrainer:
                     )
                     policy_log_probs = policy_outputs["log_probs"]
                     token_entropy = policy_outputs["token_entropy"]
+                    token_entropy_masked = compute_response_masked_mean(token_entropy, micro_response_mask)
 
                 micro_loss, micro_metadata = grpo_microbatch_train_step(
                     policy_log_probs=policy_log_probs,
                     response_mask=micro_response_mask,
-                    gradient_accumulation_steps=self.train_config.gradient_accumulation_steps,
+                    gradient_accumulation_steps=len(micro_batches),
                     loss_type=self.train_config.loss_type,
                     raw_rewards=micro_raw_rewards,
                     advantages=micro_advantages,
@@ -471,12 +508,10 @@ class GRPOTrainer:
                 )
 
                 batch_loss += to_float(micro_loss)
-                token_entropy_avg += (
-                    to_float(token_entropy.mean()) / self.train_config.gradient_accumulation_steps
-                )
+                token_entropy_avg += to_float(token_entropy_masked) / len(micro_batches)
 
             print_color(
-                f"GRPO Step {self.grpo_cur_step} | Train Step {train_step + 1}/{n_train_steps} | "
+                f"GRPO Step {self.grpo_cur_step} | Train Step {train_step}/{len(train_batches)} | "
                 f"Batch Loss: {batch_loss:.4f} | Avg Token Entropy: {token_entropy_avg:.4f}",
                 color="green",
             )
@@ -495,6 +530,7 @@ class GRPOTrainer:
             "train/token_entropy_avg": token_entropy_avg,
             "train/grad_norm": grad_norm,
             "train/ave_length": ave_length,
+            **{f"train/{key}": value for key, value in metadata.items()},
         }
 
     def train(
@@ -532,4 +568,5 @@ class GRPOTrainer:
                 log_dict["eval/formatted_but_answer_wrong"] = out["formatted_but_answer_wrong"]
                 log_dict["eval/reward_1"] = out["reward_1"]
 
-            wandb.log(log_dict, step=self.grpo_cur_step)
+            if self.train_config.wandb_logging:
+                wandb.log(log_dict, step=self.grpo_cur_step)

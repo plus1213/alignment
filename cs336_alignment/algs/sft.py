@@ -28,6 +28,7 @@ from cs336_alignment.eval import evaluate_responses
 from cs336_alignment.lr import get_lr, update_learning_rate
 from cs336_alignment.utils import (
     clear_memory,
+    compute_response_masked_mean,
     cycle_dataloader,
     get_ctx,
     load_dataset,
@@ -248,7 +249,7 @@ class SFTTrainer:
             device=device,
         )
         trainer.optimizer.load_state_dict(state["optimizer_state_dict"])
-        trainer.start_step = state["step"]
+        trainer.start_step = state.get("cur_step", state.get("step", 0))
 
         print_color(
             f"Loaded SFTTrainer from checkpoint: {checkpoint_path}, starting from step {trainer.start_step}",
@@ -328,12 +329,11 @@ class SFTTrainer:
                     gradient_accumulation_steps=self.train_config.gradient_accumulation_steps,
                     normalize_constant=1,
                 )
+                token_entropy_masked = compute_response_masked_mean(token_entropy, response_mask)
 
             del input_ids, labels, response_mask
             batch_loss += to_float(loss_scaled)
-            token_entropy_avg += (
-                to_float(token_entropy.mean()) / self.train_config.gradient_accumulation_steps
-            )
+            token_entropy_avg += to_float(token_entropy_masked) / self.train_config.gradient_accumulation_steps
 
         nn.utils.clip_grad_norm_(self.model.parameters(), self.train_config.max_grad_norm)
         update_learning_rate(

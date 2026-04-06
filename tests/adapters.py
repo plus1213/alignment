@@ -394,6 +394,8 @@ def get_packed_sft_dataset(
     """
     # raise NotImplementedError
     import json
+    import random
+    from pathlib import Path
 
     class PackedSFTDataset(Dataset):
         def __init__(
@@ -405,51 +407,37 @@ def get_packed_sft_dataset(
         ):
             self.tokenizer = tokenizer
             self.seq_length = seq_length
+            self.examples = []
 
-            self.questions = []
-            self.answers = []
-            self.responses = []
+            template = Path("cs336_alignment/prompts/alpaca_sft.prompt").read_text(encoding="utf-8")
+            rows = []
             with open(dataset_path, "r", encoding="utf-8") as f:
                 for line in f:
-                    row = json.loads(line)
-                    self.questions.append(row["question"])
-                    self.answers.append(row["answer"])
-                    self.responses.append(row["cot"])
+                    rows.append(json.loads(line))
             if shuffle:
-                import random
+                random.shuffle(rows)
 
-                combined = list(zip(self.questions, self.answers, self.responses))
-                random.shuffle(combined)
-                self.questions[:], self.answers[:], self.responses[:] = zip(*combined)
+            packed_ids = []
+            for row in rows:
+                text = template.format(instruction=row["prompt"], response=row["response"])
+                packed_ids.extend(self.tokenizer(text, add_special_tokens=True)["input_ids"])
+
+            for start in range(0, len(packed_ids) - self.seq_length, self.seq_length):
+                chunk = packed_ids[start : start + self.seq_length + 1]
+                if len(chunk) < self.seq_length + 1:
+                    break
+                self.examples.append(
+                    {
+                        "input_ids": torch.tensor(chunk[:-1], dtype=torch.long),
+                        "labels": torch.tensor(chunk[1:], dtype=torch.long),
+                    }
+                )
 
         def __len__(self):
-            return len(self.questions)
+            return len(self.examples)
 
         def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
-            question = self.questions[idx]
-            answer = self.answers[idx]
-            response = self.responses[idx]
-
-            full_text = question + response
-
-            encoding = self.tokenizer(
-                full_text,
-                truncation=True,
-                max_length=self.seq_length,
-                padding="max_length",
-                return_tensors="pt",
-            )
-
-            input_ids = encoding["input_ids"].squeeze(0)
-            labels = input_ids.clone()
-            # Mask out the prompt tokens in the labels
-            prompt_length = len(self.tokenizer(prompt)["input_ids"])
-            labels[:prompt_length] = -100  # Ignore index for loss computation
-
-            return {
-                "input_ids": input_ids,
-                "labels": labels,
-            }
+            return self.examples[idx]
 
     return PackedSFTDataset(
         tokenizer=tokenizer,
@@ -567,4 +555,14 @@ def run_compute_per_instance_dpo_loss(
     Returns:
         torch.Tensor with the DPO loss for this example.
     """
-    raise NotImplementedError
+    from cs336_alignment.algs.dpo import compute_per_instance_dpo_loss
+
+    return compute_per_instance_dpo_loss(
+        lm=lm,
+        lm_ref=lm_ref,
+        tokenizer=tokenizer,
+        beta=beta,
+        prompt=prompt,
+        response_chosen=response_chosen,
+        response_rejected=response_rejected,
+    )

@@ -28,6 +28,7 @@ from cs336_alignment.eval import evaluate_responses
 from cs336_alignment.lr import update_learning_rate
 from cs336_alignment.utils import (
     clear_memory,
+    compute_response_masked_mean,
     cycle_dataloader,
     get_ctx,
     load_dataset,
@@ -179,7 +180,7 @@ class EITrainer:
 
         self.checkpoint_path = os.path.join(
             train_config.checkpoint_dir,
-            f"sft_{train_config.model_name.split('/')[-1]}_{train_config.dataset_name}",
+            f"ei_{train_config.model_name.split('/')[-1]}_{train_config.dataset_name}",
         )
         os.makedirs(self.checkpoint_path, exist_ok=True)
         train_config.to_json(
@@ -296,12 +297,11 @@ class EITrainer:
                         gradient_accumulation_steps=self.train_config.sft_gradient_accumulation_steps,
                         normalize_constant=1,
                     )
+                    token_entropy_masked = compute_response_masked_mean(token_entropy, response_mask)
 
                 del input_ids, labels, response_mask
                 batch_loss += to_float(loss_scaled)
-                token_entropy_avg += (
-                    to_float(token_entropy.mean()) / self.train_config.sft_gradient_accumulation_steps
-                )
+                token_entropy_avg += to_float(token_entropy_masked) / self.train_config.sft_gradient_accumulation_steps
 
             nn.utils.clip_grad_norm_(self.model.parameters(), self.train_config.max_grad_norm)
             update_learning_rate(

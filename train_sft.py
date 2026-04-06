@@ -7,7 +7,13 @@ import torch
 from transformers import AutoModelForCausalLM
 
 from cs336_alignment.algs import SFTTrainer, SFTTrainingConfig
-from cs336_alignment.utils import get_device, print_color, save_model_checkpoint, seed_everything
+from cs336_alignment.utils import (
+    get_device,
+    get_model_loading_kwargs,
+    print_color,
+    save_model_checkpoint,
+    seed_everything,
+)
 from cs336_alignment.vllm_utils import init_vllm
 
 
@@ -35,9 +41,7 @@ def main(
     model_device = get_device(rank=0, verbose=False)
     model = AutoModelForCausalLM.from_pretrained(
         pretrained_model_name_or_path=train_config.model_name,
-        dtype=torch.bfloat16,
-        attn_implementation="flash_attention_2",
-        device_map="cpu",
+        **get_model_loading_kwargs(model_device),
     )
     model.to(model_device)
     print_color(f"Loaded model to {str(model_device)}", color="cyan")

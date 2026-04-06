@@ -7,7 +7,13 @@ import torch
 from transformers import AutoModelForCausalLM
 
 from cs336_alignment.algs import EITrainConfig, EITrainer
-from cs336_alignment.utils import get_device, print_color, seed_everything
+from cs336_alignment.utils import (
+    get_device,
+    get_model_loading_kwargs,
+    print_color,
+    save_model_checkpoint,
+    seed_everything,
+)
 from cs336_alignment.vllm_utils import init_vllm
 
 
@@ -35,9 +41,7 @@ def main(
     model_device = get_device(rank=0, verbose=False)
     model = AutoModelForCausalLM.from_pretrained(
         pretrained_model_name_or_path=train_config.model_name,
-        dtype=torch.bfloat16,
-        attn_implementation="flash_attention_2",
-        device_map="cpu",
+        **get_model_loading_kwargs(model_device),
     )
     model.to(model_device)
     print_color(f"Loaded model to {str(model_device)}", color="cyan")
@@ -65,7 +69,13 @@ def main(
     ei_trainer.train(vllm=vllm)
 
     print_color("Training completed. Saving final model checkpoint...", color="green")
-    # checkpoint_file = os.path.join(ei_trainer.checkpoint_path, "checkpoint_final.pt")
+    checkpoint_file = os.path.join(ei_trainer.checkpoint_path, "checkpoint_final.pt")
+    save_model_checkpoint(
+        model=ei_trainer.model,
+        optimizer=ei_trainer.optimizer,
+        cur_step=ei_trainer.sft_cur_step,
+        checkpoint_path=checkpoint_file,
+    )
 
     # Cleanup
     if train_config.wandb_logging:

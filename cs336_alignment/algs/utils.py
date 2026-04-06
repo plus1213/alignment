@@ -104,8 +104,9 @@ def masked_mean(
     mask_f = mask.type_as(tensor)
     masked_tensor = tensor * mask_f
     sum_masked = torch.sum(masked_tensor, dim=dim)
-    count_nonzero = torch.sum(mask, dim=dim).clamp(min=1e-8)
-    mean = sum_masked / count_nonzero
+    count_nonzero = torch.sum(mask, dim=dim)
+    nan_fill = torch.full_like(sum_masked, torch.nan, dtype=tensor.dtype)
+    mean = torch.where(count_nonzero > 0, sum_masked / count_nonzero.type_as(tensor), nan_fill)
     return mean
 
 

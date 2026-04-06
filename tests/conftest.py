@@ -10,6 +10,8 @@ import torch
 from torch import Tensor
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+from .common import FIXTURES_PATH
+
 
 def pytest_addoption(parser):
     parser.addoption(
@@ -212,13 +214,18 @@ def output_strs():
 
 
 @pytest.fixture
-def model_id():
-    return "./models/Qwen2.5-Math-1.5B"
+def tokenizer_id():
+    return FIXTURES_PATH / "Meta-Llama-3-8B"
 
 
 @pytest.fixture
-def tokenizer(model_id):
-    return AutoTokenizer.from_pretrained(model_id)
+def model_id():
+    return FIXTURES_PATH / "tiny-gpt2"
+
+
+@pytest.fixture
+def tokenizer(tokenizer_id):
+    return AutoTokenizer.from_pretrained(tokenizer_id)
 
 
 @pytest.fixture
